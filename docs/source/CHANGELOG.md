@@ -1,5 +1,5 @@
 ## [unreleased]
 
-### ⚙️ Miscellaneous Tasks
+### 🐛 Bug Fixes
 
-- Updating version of r2x-core and adding first version of docs (#3)
+- H5py does not work with 3.14 yet.

@@ -26,6 +26,7 @@ from .getters import (
     build_reserve_name,
     build_transmission_interface_name,
     build_transmission_line_name,
+    resolve_emission_generator_identifier,
 )
 from .models.components import (
     ReEDSDemand,
@@ -142,7 +143,7 @@ class ReEDSParser(BaseParser):
     >>> mapping_path = ReEDSConfig.get_file_mapping_path()
     >>> data_folder = Path("tests/data/test_Pacific")
     >>> data_store = DataStore.from_json(mapping_path, path=data_folder)
-    >>> parser = ReEDSParser(config, data_store=data_store, name="ReEDS_System")
+    >>> parser = ReEDSParser(config, store=data_store, name="ReEDS_System")
     >>> system = parser.build_system()
 
     Notes
@@ -157,7 +158,7 @@ class ReEDSParser(BaseParser):
         /,
         config: ReEDSConfig,
         *,
-        data_store: DataStore,
+        store: DataStore,
         auto_add_composed_components: bool = True,
         skip_validation: bool = False,
         overrides: dict[str, Any] | None = None,
@@ -169,7 +170,7 @@ class ReEDSParser(BaseParser):
         ----------
         config : ReEDSConfig
             Configuration object specifying solve years, weather years, case name, and scenario
-        data_store : DataStore
+        store : DataStore
             Initialized DataStore with ReEDS file mappings and data access
         auto_add_composed_components : bool, optional
             Whether to automatically add composed components to the system, by default True
@@ -197,7 +198,7 @@ class ReEDSParser(BaseParser):
 
         super().__init__(
             config=config,
-            data_store=data_store,
+            data_store=store,
             auto_add_composed_components=auto_add_composed_components,
             skip_validation=skip_validation,
             **kwargs,
@@ -509,7 +510,7 @@ class ReEDSParser(BaseParser):
                 region = self.create_component(ReEDSRegion, **kwargs)
             except ComponentCreationError as exc:
                 creation_errors.append(f"{identifier}: {exc}")
-                logger.error("Failed to create region %s: %s", identifier, exc)
+                logger.error("Failed to create region {}: {}", identifier, exc)
                 continue
 
             self.add_component(region)
@@ -699,11 +700,16 @@ class ReEDSParser(BaseParser):
                 .alias("region_b"),
             )
             .select(
+                pl.col("region_a"),
+                pl.col("region_b"),
+                pl.col("trtype"),
+            )
+            .unique(subset=["region_a", "region_b"])
+            .select(
                 pl.col("region_a").alias("from_region"),
                 pl.col("region_b").alias("to_region"),
                 pl.col("trtype"),
             )
-            .unique()
         )
         logger.trace("Derived {} unique transmission interface rows", interface_rows.height)
 
@@ -723,7 +729,7 @@ class ReEDSParser(BaseParser):
                 interface = self.create_component(ReEDSInterface, **kwargs)
             except ComponentCreationError as exc:
                 creation_errors.append(f"{identifier}: {exc}")
-                logger.error("Failed to create transmission interface %s: %s", identifier, exc)
+                logger.error("Failed to create transmission interface {}: {}", identifier, exc)
                 continue
 
             self.add_component(interface)
@@ -760,7 +766,7 @@ class ReEDSParser(BaseParser):
                 line = self.create_component(ReEDSTransmissionLine, **kwargs)
             except ComponentCreationError as exc:
                 creation_errors.append(f"{identifier}: {exc}")
-                logger.error("Failed to create transmission line %s: %s", identifier, exc)
+                logger.error("Failed to create transmission line {}: {}", identifier, exc)
                 continue
 
             self.add_component(line)
@@ -814,7 +820,7 @@ class ReEDSParser(BaseParser):
                 demand = self.create_component(ReEDSDemand, **kwargs)
             except ComponentCreationError as exc:
                 creation_errors.append(f"{identifier}: {exc}")
-                logger.error("Failed to create load %s: %s", identifier, exc)
+                logger.error("Failed to create load {}: {}", identifier, exc)
                 continue
 
             self.add_component(demand)
@@ -876,7 +882,7 @@ class ReEDSParser(BaseParser):
                 reserve_region = self.create_component(ReEDSReserveRegion, name=region_name)
             except ComponentCreationError as exc:
                 reserve_region_errors.append(f"{region_name}: {exc}")
-                logger.error("Failed to create reserve region %s: %s", region_name, exc)
+                logger.error("Failed to create reserve region {}: {}", region_name, exc)
                 continue
 
             self.add_component(reserve_region)
@@ -944,7 +950,7 @@ class ReEDSParser(BaseParser):
                 reserve = self.create_component(ReEDSReserve, **kwargs)
             except ComponentCreationError as exc:
                 creation_errors.append(f"{identifier}: {exc}")
-                logger.error("Failed to create reserve %s: %s", identifier, exc)
+                logger.error("Failed to create reserve {}: {}", identifier, exc)
                 continue
 
             self.add_component(reserve)
@@ -988,41 +994,71 @@ class ReEDSParser(BaseParser):
             return emission_rule_result
         emission_rule = emission_rule_result.ok()
 
+        generated = list(self._generator_cache.values())
+        if not generated:
+            logger.warning("No generators available for emission matching")
+            logger.info("Attached 0 emission components")
+            return Ok(None)
+
+        rename_map = {
+            "i": "technology",
+            "v": "vintage",
+            "r": "region",
+        }
+        emit_df = df.rename({k: v for k, v in rename_map.items() if k in df.columns}).with_columns(
+            pl.col("vintage").fill_null("__missing_vintage__").alias("vintage_key")
+        )
+
+        generator_lookup: dict[tuple[str | None, str | None, str], list[str]] = {}
+        for generated_name in generated:
+            vintage_key = generated_name.vintage or "__missing_vintage__"
+            key = (generated_name.technology, generated_name.region.name, vintage_key)
+            generator_lookup.setdefault(key, []).append(generated_name.name)
+
+        matched_rows: list[dict[str, Any]] = []
+        for row in emit_df.iter_rows(named=True):
+            key = (row.get("technology"), row.get("region"), row.get("vintage_key"))
+            generator_names = generator_lookup.get(key)
+            if not generator_names:
+                continue
+            row_data = dict(row)
+            row_data["name"] = generator_names[0]
+            matched_rows.append(row_data)
+
+        if not matched_rows:
+            logger.warning("No emission rows matched existing generators, skipping emissions")
+            logger.info("Attached 0 emission components")
+            return Ok(None)
+
+        emission_matches = pl.DataFrame(matched_rows).drop("vintage_key")
+
+        if emission_matches.is_empty():
+            logger.warning("No emission rows matched existing generators, skipping emissions")
+            logger.info("Attached 0 emission components")
+            return Ok(None)
+
         emission_kwargs_result = _collect_component_kwargs_from_rule(
-            data=df,
+            data=emission_matches,
             rule_provider=emission_rule,
             parser_context=self._ctx,
-            row_identifier_getter=partial(build_generator_name, self._ctx),
+            row_identifier_getter=lambda row: resolve_emission_generator_identifier(self._ctx, row),
         )
         if emission_kwargs_result.is_err():
             return emission_kwargs_result
-
-        def _aggregated_identifier(name: str) -> str | None:
-            """Generate an aggregated generator identifier for emission lookups."""
-            parts = name.split("_")
-            if len(parts) < 3:
-                return None
-            return f"{'_'.join(parts[:-2])}_{parts[-1]}"
 
         creation_errors: list[str] = []
         attached = 0
         for identifier, kwargs in emission_kwargs_result.ok() or []:
             generator = self._generator_cache.get(identifier)
-            fallback_identifier = None
             if generator is None:
-                fallback_identifier = _aggregated_identifier(identifier)
-                if fallback_identifier is not None:
-                    generator = self._generator_cache.get(fallback_identifier)
-                if generator is None:
-                    logger.debug("Generator %s not found for emission, skipping", identifier)
-                    continue
-                logger.debug("Using aggregated generator {} for emission {}", fallback_identifier, identifier)
+                logger.debug("Generator %s not found for emission, skipping", identifier)
+                continue
 
             try:
                 emission = self.create_component(ReEDSEmission, **kwargs)
             except ComponentCreationError as exc:
                 creation_errors.append(f"{identifier}: {exc}")
-                logger.error("Failed to create emission %s: %s", identifier, exc)
+                logger.error("Failed to create emission {}: {}", identifier, exc)
                 continue
 
             self.system.add_supplemental_attribute(generator, emission)
@@ -1337,9 +1373,26 @@ class ReEDSParser(BaseParser):
                 ["year", "vintage"]
             ):
                 year = row[0]
-                hourly_budget = monthly_to_hourly_polars(year, month_budget_by_vintage["daily_energy_budget"])
+                monthly_profile = month_budget_by_vintage["daily_energy_budget"].to_list()
+                if len(monthly_profile) != 12 or any(value is None for value in monthly_profile):
+                    logger.warning(
+                        "Skipping hydro budget for {} in {} because monthly profile length {}",
+                        generator.name,
+                        year,
+                        len(monthly_profile),
+                    )
+                    continue
+                hourly_budget_result = monthly_to_hourly_polars(year, monthly_profile)
+                if hourly_budget_result.is_err():
+                    logger.warning(
+                        "Skipping hydro budget for {} in {}: {}",
+                        generator.name,
+                        year,
+                        hourly_budget_result.err(),
+                    )
+                    continue
                 ts = SingleTimeSeries.from_array(
-                    data=hourly_budget.unwrap(),
+                    data=hourly_budget_result.ok(),
                     name="hydro_budget",
                     initial_timestamp=self.initial_timestamp,
                     resolution=timedelta(hours=1),
